@@ -1,51 +1,42 @@
-#include "../include/manifest.hpp"
+#include "manifest.hpp"
 
 #include <fstream>
 
 
-void Manifest::save(
-
-    const std::string& path,
-
+void generateManifest(
     const std::vector<VideoInfo>& videos
-
 )
 {
 
-    std::ofstream out(path);
+    std::ofstream out(
+        "../output/manifest.json"
+    );
 
 
     out << "{\n";
-
     out << "\"schema_version\":\"external-video-ingest-v1\",\n";
-
-    out << "\"source_system\":\"firefly-capture\",\n";
-
     out << "\"videos\":[\n";
 
 
-    for(size_t i=0;i<videos.size();i++)
+    for(size_t i = 0; i < videos.size(); i++)
     {
-
-        auto &v = videos[i];
-
 
         out << "{\n";
 
         out << "\"camera_number\":"
-            << v.camera_number
+            << videos[i].camera_number
             << ",\n";
 
 
         out << "\"file_name\":\""
-            << v.file
+            << videos[i].file
             << "\"\n";
 
 
         out << "}";
 
 
-        if(i+1 < videos.size())
+        if(i + 1 < videos.size())
             out << ",";
 
 
@@ -54,6 +45,6 @@ void Manifest::save(
 
 
     out << "]\n";
-
     out << "}\n";
+
 }

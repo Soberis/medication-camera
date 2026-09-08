@@ -1,33 +1,30 @@
 #include "camera_device.hpp"
 
-#include <opencv2/opencv.hpp>
-
 #include <iostream>
-#include <chrono>
-#include <iomanip>
+#include <opencv2/opencv.hpp>
 
 
 CameraDevice::CameraDevice(
-    std::shared_ptr<ob::Device> dev,
+    std::shared_ptr<ob::Device> device,
     const std::string& sn,
     const std::string& filename
 )
-    :
-    device(dev),
-    serial(sn),
-    output(filename)
+:
+device(device),
+sn(sn),
+filename(filename)
 {
 
 }
 
 
-
 bool CameraDevice::startRecord()
 {
+
     try
     {
 
-        auto pipeline =
+        pipeline =
             std::make_shared<ob::Pipeline>(device);
 
 
@@ -37,6 +34,7 @@ bool CameraDevice::startRecord()
 
         /*
          * RGB
+         * 1920x1080 MJPG
          */
         auto colorProfiles =
             pipeline->getStreamProfileList(
@@ -53,83 +51,45 @@ bool CameraDevice::startRecord()
             );
 
 
-        /*
-         * Depth
-         */
-        auto depthProfiles =
-            pipeline->getStreamProfileList(
-                OB_SENSOR_DEPTH
-            );
-
-
-        auto depthProfile =
-            depthProfiles->getVideoStreamProfile(
-                1280,
-                800,
-                OB_FORMAT_Y16,
-                30
-            );
-
-
         config->enableStream(
             colorProfile
         );
 
 
-        config->enableStream(
-            depthProfile
-        );
+        std::cout
+            << "[" << sn << "] "
+            << "starting pipeline"
+            << std::endl;
 
-
-        config->setFrameAggregateOutputMode(
-            OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE
-        );
-
-
-        pipeline->enableFrameSync();
 
 
         pipeline->start(config);
 
 
 
-        /*
-         * MP4 writer
-         *
-         * 使用 MJPG
-         * 避免 RK3588 h264_v4l2m2m失败
-         */
-
         writer.open(
-
-            output,
-
+            filename,
             cv::VideoWriter::fourcc(
-                'M',
-                'J',
-                'P',
-                'G'
+                'm',
+                'p',
+                '4',
+                'v'
             ),
-
             30,
-
             cv::Size(
                 1920,
                 1080
             )
-
         );
 
 
         if(!writer.isOpened())
         {
             std::cerr
-            << "["<<serial<<"] "
-            << "video writer open failed "
-            << output
-            << std::endl;
-
-            pipeline->stop();
+                << "["
+                << sn
+                << "] video writer open failed"
+                << std::endl;
 
             return false;
         }
@@ -137,19 +97,22 @@ bool CameraDevice::startRecord()
 
 
         std::cout
-        << "["<<serial<<"] "
-        << "record start -> "
-        << output
-        << std::endl;
+            << "[" << sn << "] "
+            << "record start -> "
+            << filename
+            << std::endl;
 
 
 
-        running=true;
+        /*
+         * 当前先测试单相机稳定录像
+         */
+        int frameCount = 0;
 
 
-
-        while(running)
+        while(frameCount < 300)
         {
+
 
             auto frameset =
                 pipeline->waitForFrameset(
@@ -159,18 +122,24 @@ bool CameraDevice::startRecord()
 
             if(!frameset)
             {
+                std::cout
+                    << "["
+                    << sn
+                    << "] timeout"
+                    << std::endl;
+
                 continue;
             }
 
 
 
-            auto colorRaw =
+            auto colorFrame =
                 frameset->getFrame(
                     OB_FRAME_COLOR
                 );
 
 
-            if(!colorRaw)
+            if(!colorFrame)
             {
                 continue;
             }
@@ -178,109 +147,89 @@ bool CameraDevice::startRecord()
 
 
             auto color =
-                colorRaw->as<
+                colorFrame->as<
                     ob::ColorFrame
                 >();
 
 
 
-            cv::Mat frame(
-
-                color->getHeight(),
-
-                color->getWidth(),
-
-                CV_8UC3
-
-            );
-
-
             /*
-             * MJPG转换BGR
+             * Gemini335 RGB MJPG
+             * 转 OpenCV Mat
              */
-
-            cv::Mat mjpg(
-
+            cv::Mat image(
                 color->getHeight(),
-
                 color->getWidth(),
-
-                CV_8UC1,
-
-                (void*)color->getData()
-
+                CV_8UC3,
+                color->getData()
             );
 
 
-            cv::imdecode(
-
-                mjpg,
-
-                cv::IMREAD_COLOR
-
-            ).copyTo(frame);
-
-
-
-            if(frame.empty())
+            if(image.empty())
             {
+                std::cerr
+                    << "["
+                    << sn
+                    << "] empty image"
+                    << std::endl;
+
                 continue;
             }
 
 
 
-            writer.write(frame);
-
+            writer.write(
+                image
+            );
 
 
             frameCount++;
 
 
 
-            if(frameCount%30==0)
+            if(frameCount % 30 == 0)
             {
-
                 std::cout
-                <<"["<<serial<<"] "
-                <<"frames="
-                <<frameCount
-                <<std::endl;
-
+                    << "["
+                    << sn
+                    << "] frame "
+                    << frameCount
+                    << std::endl;
             }
-
 
         }
 
 
+
         pipeline->stop();
+
 
         writer.release();
 
 
+
+        std::cout
+            << "["
+            << sn
+            << "] record finished"
+            << std::endl;
+
+
+
         return true;
 
-
     }
-
     catch(ob::Error &e)
     {
 
         std::cerr
-        <<"ORBBEC ERROR "
-        <<e.what()
-        <<std::endl;
+            << "[ORBBEC ERROR]"
+            << std::endl
+            << e.what()
+            << std::endl;
+
 
         return false;
-
     }
-
-}
-
-
-
-void CameraDevice::stop()
-{
-
-    running=false;
 
 }
