@@ -1,0 +1,34 @@
+# Build
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Runtime output
+output/
+Log/
+logs/
+
+# Videos / camera data
+*.mp4
+*.avi
+*.mkv
+*.bin
+*.bag
+
+# Compiled binaries
+camera_test
+medication_camera
+*.o
+*.so
+*.a
+
+# Editor
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
