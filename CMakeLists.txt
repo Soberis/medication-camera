@@ -1,60 +1,19 @@
 cmake_minimum_required(VERSION 3.10)
-
-project(medication-camera)
-
-
+project(medication-camera LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
-
-
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(ORBBEC_SDK_PATH
-/opt/orbbec/OrbbecSDK_v2.9.3_202607151523_2f6561c_linux_arm64
-)
-
-
-find_package(OpenCV REQUIRED)
-
-
-include_directories(
-
-include
-
-${ORBBEC_SDK_PATH}/include
-
-${OpenCV_INCLUDE_DIRS}
-
-)
-
-
-link_directories(
-
-${ORBBEC_SDK_PATH}/lib
-
-)
-
-
-add_executable(
-
-medication_camera
-
-src/main.cpp
-
-src/camera_manager.cpp
-
-src/camera_device.cpp
-
-src/manifest.cpp
-
-)
-
-
-target_link_libraries(
-
-medication_camera
-
-OrbbecSDK
-
-${OpenCV_LIBS}
-
-pthread
-
-)
+    "/opt/orbbec/OrbbecSDK_v2.9.3_202607151523_2f6561c_linux_arm64"
+    CACHE PATH "OrbbecSDK v2.9.3 installation root")
+find_package(OpenCV REQUIRED COMPONENTS core imgcodecs videoio)
+find_package(Threads REQUIRED)
+find_library(ORBBEC_LIBRARY NAMES OrbbecSDK PATHS "${ORBBEC_SDK_PATH}/lib" NO_DEFAULT_PATH)
+if(NOT ORBBEC_LIBRARY OR NOT EXISTS "${ORBBEC_SDK_PATH}/include/libobsensor/ObSensor.hpp")
+    message(FATAL_ERROR "Orbbec SDK not found; set -DORBBEC_SDK_PATH=/path/to/sdk")
+endif()
+add_executable(medication_camera src/main.cpp src/camera_manager.cpp src/camera_device.cpp src/manifest.cpp)
+target_include_directories(medication_camera PRIVATE include "${ORBBEC_SDK_PATH}/include" ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(medication_camera PRIVATE ${ORBBEC_LIBRARY} ${OpenCV_LIBS} Threads::Threads)
+target_compile_options(medication_camera PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(medication_camera PROPERTIES BUILD_RPATH "${ORBBEC_SDK_PATH}/lib")

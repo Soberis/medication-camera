@@ -1,30 +1,11 @@
 #pragma once
-
-#include <libobsensor/ObSensor.hpp>
+#include "camera_device.hpp"
 #include <vector>
-#include <memory>
 
-
-struct CameraInfo
-{
-    int number;
-    std::string sn;
-    std::shared_ptr<ob::Device> device;
-};
-
-
-class CameraManager
-{
-
+class CameraManager {
 public:
-
-    CameraManager();
-
-    std::vector<CameraInfo> scan();
-
-
+    std::vector<std::shared_ptr<CameraDevice>> open(
+        const std::vector<CameraConfig>& cameras, const std::string& directory);
 private:
-
-    ob::Context ctx;
-
+    ob::Context context;
 };

@@ -1,0 +1,31 @@
+{
+  "platform_base_url": "http://192.168.5.10:8080",
+  "allow_http": true,
+  "project_id": "REPLACE_WITH_PLATFORM_PROJECT_UUID",
+  "device_id": "rk3588-camera-01",
+  "source_system": "medication-camera",
+  "timezone": "Asia/Shanghai",
+  "duration_seconds": 10,
+  "camera_set_key": "rk3588-camera-01",
+  "configuration_version": 1,
+  "camera_layout_version": "gemini335-dual-v1",
+  "camera_set_id": "",
+  "cameras": [
+    {
+      "camera_number": 1,
+      "serial": "CP0F463000J6",
+      "provisioning_key": "rk3588-camera-01.camera-1",
+      "camera_channel_id": "",
+      "camera_role": "OVERVIEW",
+      "mount_position": "camera-1"
+    },
+    {
+      "camera_number": 2,
+      "serial": "CP0F463000L6",
+      "provisioning_key": "rk3588-camera-01.camera-2",
+      "camera_channel_id": "",
+      "camera_role": "HANDS",
+      "mount_position": "camera-2"
+    }
+  ]
+}

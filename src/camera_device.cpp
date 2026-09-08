@@ -1,235 +1,85 @@
 #include "camera_device.hpp"
-
+#include "manifest.hpp"
+#include <filesystem>
 #include <iostream>
-#include <opencv2/opencv.hpp>
+#include <limits>
+#include <stdexcept>
 
+CameraDevice::CameraDevice(std::shared_ptr<ob::Device> device, CameraConfig config,
+                           const std::string& outputDirectory)
+    : config(std::move(config)), directory(outputDirectory),
+      pipeline(std::make_shared<ob::Pipeline>(device)) {}
 
-CameraDevice::CameraDevice(
-    std::shared_ptr<ob::Device> device,
-    const std::string& sn,
-    const std::string& filename
-)
-:
-device(device),
-sn(sn),
-filename(filename)
-{
+CameraDevice::~CameraDevice() { stop(); }
 
+void CameraDevice::start() {
+    auto profiles = pipeline->getStreamProfileList(OB_SENSOR_COLOR);
+    auto profile = profiles->getVideoStreamProfile(1920, 1080, OB_FORMAT_MJPG, 30);
+    auto streamConfig = std::make_shared<ob::Config>();
+    streamConfig->enableStream(profile);
+    const auto path = std::filesystem::path(directory) /
+                      ("camera_" + std::to_string(config.number) + ".raw.mp4");
+    if (std::filesystem::exists(path))
+        throw std::runtime_error("Refusing to overwrite an existing recording");
+    if (!writer.open(path.string(), cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                     30, cv::Size(1920, 1080)))
+        throw std::runtime_error("Cannot open MP4 writer for camera " + config.serial);
+    pipeline->start(streamConfig);
+    streaming = true;
 }
 
-
-bool CameraDevice::startRecord()
-{
-
-    try
-    {
-
-        pipeline =
-            std::make_shared<ob::Pipeline>(device);
-
-
-        auto config =
-            std::make_shared<ob::Config>();
-
-
-        /*
-         * RGB
-         * 1920x1080 MJPG
-         */
-        auto colorProfiles =
-            pipeline->getStreamProfileList(
-                OB_SENSOR_COLOR
-            );
-
-
-        auto colorProfile =
-            colorProfiles->getVideoStreamProfile(
-                1920,
-                1080,
-                OB_FORMAT_MJPG,
-                30
-            );
-
-
-        config->enableStream(
-            colorProfile
-        );
-
-
-        std::cout
-            << "[" << sn << "] "
-            << "starting pipeline"
-            << std::endl;
-
-
-
-        pipeline->start(config);
-
-
-
-        writer.open(
-            filename,
-            cv::VideoWriter::fourcc(
-                'm',
-                'p',
-                '4',
-                'v'
-            ),
-            30,
-            cv::Size(
-                1920,
-                1080
-            )
-        );
-
-
-        if(!writer.isOpened())
-        {
-            std::cerr
-                << "["
-                << sn
-                << "] video writer open failed"
-                << std::endl;
-
-            return false;
+RecordingResult CameraDevice::record(std::chrono::steady_clock::time_point deadline,
+                                     const std::atomic<bool>& cancelled) {
+    RecordingResult result{config.number, config.serial,
+                           "camera_" + std::to_string(config.number) + ".raw.mp4", ""};
+    auto started = std::chrono::steady_clock::now();
+    auto lastFrame = started;
+    auto lastReport = started;
+    int lastCount = 0;
+    while (!cancelled && std::chrono::steady_clock::now() < deadline) {
+        auto frames = pipeline->waitForFrameset(1000);
+        auto frame = frames ? frames->getFrame(OB_FRAME_COLOR) : nullptr;
+        if (!frame) {
+            ++result.timeouts;
+            if (std::chrono::steady_clock::now() - lastFrame > std::chrono::seconds(5))
+                throw std::runtime_error("No RGB frames for 5 seconds: " + config.serial);
+            continue;
         }
-
-
-
-        std::cout
-            << "[" << sn << "] "
-            << "record start -> "
-            << filename
-            << std::endl;
-
-
-
-        /*
-         * 当前先测试单相机稳定录像
-         */
-        int frameCount = 0;
-
-
-        while(frameCount < 300)
-        {
-
-
-            auto frameset =
-                pipeline->waitForFrameset(
-                    1000
-                );
-
-
-            if(!frameset)
-            {
-                std::cout
-                    << "["
-                    << sn
-                    << "] timeout"
-                    << std::endl;
-
-                continue;
-            }
-
-
-
-            auto colorFrame =
-                frameset->getFrame(
-                    OB_FRAME_COLOR
-                );
-
-
-            if(!colorFrame)
-            {
-                continue;
-            }
-
-
-
-            auto color =
-                colorFrame->as<
-                    ob::ColorFrame
-                >();
-
-
-
-            /*
-             * Gemini335 RGB MJPG
-             * 转 OpenCV Mat
-             */
-            cv::Mat image(
-                color->getHeight(),
-                color->getWidth(),
-                CV_8UC3,
-                color->getData()
-            );
-
-
-            if(image.empty())
-            {
-                std::cerr
-                    << "["
-                    << sn
-                    << "] empty image"
-                    << std::endl;
-
-                continue;
-            }
-
-
-
-            writer.write(
-                image
-            );
-
-
-            frameCount++;
-
-
-
-            if(frameCount % 30 == 0)
-            {
-                std::cout
-                    << "["
-                    << sn
-                    << "] frame "
-                    << frameCount
-                    << std::endl;
-            }
-
+        auto color = frame->as<ob::ColorFrame>();
+        const auto size = color->getDataSize();
+        if (!size || size > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+            throw std::runtime_error("Invalid MJPG frame size");
+        // MJPG is compressed bytes, not a width * height BGR pixel buffer.
+        cv::Mat encoded(1, static_cast<int>(size), CV_8UC1, color->getData());
+        auto image = cv::imdecode(encoded, cv::IMREAD_COLOR);
+        if (image.empty() || image.size() != cv::Size(1920, 1080))
+            throw std::runtime_error("Invalid decoded RGB frame: " + config.serial);
+        if (result.frames == 0) result.startedAt = utcNow();
+        writer.write(image);
+        ++result.frames;
+        lastFrame = std::chrono::steady_clock::now();
+        const double interval = std::chrono::duration<double>(lastFrame - lastReport).count();
+        if (interval >= 1.0) {
+            std::cout << "camera=" << config.number << " sn=" << config.serial
+                      << " rgb_fps=" << (result.frames - lastCount) / interval
+                      << " timeouts=" << result.timeouts << std::endl;
+            lastReport = lastFrame;
+            lastCount = result.frames;
         }
-
-
-
-        pipeline->stop();
-
-
-        writer.release();
-
-
-
-        std::cout
-            << "["
-            << sn
-            << "] record finished"
-            << std::endl;
-
-
-
-        return true;
-
     }
-    catch(ob::Error &e)
-    {
+    result.elapsedSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    stop();
+    if (cancelled) throw std::runtime_error("Recording cancelled because another camera failed");
+    if (result.frames == 0) throw std::runtime_error("Recording contains no frames");
+    return result;
+}
 
-        std::cerr
-            << "[ORBBEC ERROR]"
-            << std::endl
-            << e.what()
-            << std::endl;
-
-
-        return false;
+void CameraDevice::stop() noexcept {
+    if (streaming) {
+        try { pipeline->stop(); }
+        catch (...) { std::cerr << "Pipeline stop failed: " << config.serial << std::endl; }
+        streaming = false;
     }
-
+    try { writer.release(); } catch (...) {}
 }

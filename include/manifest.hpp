@@ -1,16 +1,7 @@
 #pragma once
-
-#include <string>
+#include "camera_device.hpp"
 #include <vector>
 
-
-struct VideoInfo
-{
-    int camera_number;
-    std::string file;
-};
-
-
-void generateManifest(
-    const std::vector<VideoInfo>& videos
-);
+std::string utcNow();
+void writeRecordingResult(const std::string& directory,
+                          const std::vector<RecordingResult>& results);

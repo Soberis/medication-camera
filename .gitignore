@@ -32,3 +32,15 @@ medication_camera
 # OS
 .DS_Store
 Thumbs.db
+
+# Local configuration, credentials, and durable capture tasks
+config/edge.json
+config/*.local.json
+spool/
+.env
+.env.*
+*.pem
+*.key
+__pycache__/
+*.py[cod]
+.runtime/
