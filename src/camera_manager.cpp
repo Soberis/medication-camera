@@ -12,6 +12,14 @@ std::vector<std::shared_ptr<CameraDevice>> CameraManager::open(
     }
     std::vector<std::shared_ptr<CameraDevice>> result;
     for (const auto& camera : cameras) {
+        if (camera.serial == "auto") {
+            if (devices.empty())
+                throw std::runtime_error("No available Orbbec camera devices found on USB");
+            auto it = devices.begin();
+            result.push_back(std::make_shared<CameraDevice>(it->second, CameraConfig{camera.number, it->first}, directory));
+            devices.erase(it);
+            continue;
+        }
         auto found = devices.find(camera.serial);
         if (found == devices.end())
             throw std::runtime_error("Configured camera missing: " + camera.serial);

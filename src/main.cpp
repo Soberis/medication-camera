@@ -23,11 +23,14 @@ int main(int argc, char** argv) {
             CameraConfig camera{static_cast<int>(node["camera_number"]),
                                 static_cast<std::string>(node["serial"])};
             if (camera.number < 1 || camera.number > 64 || camera.serial.empty() ||
-                !numbers.insert(camera.number).second || !serials.insert(camera.serial).second)
-                throw std::runtime_error("Invalid or duplicate camera identity");
+                !numbers.insert(camera.number).second)
+                throw std::runtime_error("Invalid camera identity");
+            if (camera.serial != "auto" && !serials.insert(camera.serial).second)
+                throw std::runtime_error("Duplicate camera serial");
             config.push_back(camera);
         }
-        if (config.size() != 2) throw std::runtime_error("This recorder requires two configured cameras");
+        if (config.empty() || config.size() > 2)
+            throw std::runtime_error("This recorder requires 1 or 2 configured cameras");
         if (!std::filesystem::create_directory(argv[2]))
             throw std::runtime_error("Output directory already exists; refusing overwrite");
         CameraManager manager;
