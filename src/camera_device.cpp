@@ -21,9 +21,28 @@ void CameraDevice::start() {
                       ("camera_" + std::to_string(config.number) + ".raw.mp4");
     if (std::filesystem::exists(path))
         throw std::runtime_error("Refusing to overwrite an existing recording");
-    if (!writer.open(path.string(), cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
-                     30, cv::Size(1920, 1080)))
-        throw std::runtime_error("Cannot open MP4 writer for camera " + config.serial);
+    std::vector<std::pair<std::string, int>> codecs = {
+        {"avc1", cv::VideoWriter::fourcc('a', 'v', 'c', '1')},
+        {"H264", cv::VideoWriter::fourcc('H', '2', '6', '4')},
+        {"MJPG", cv::VideoWriter::fourcc('M', 'J', 'P', 'G')},
+        {"XVID", cv::VideoWriter::fourcc('X', 'V', 'I', 'D')},
+        {"mp4v", cv::VideoWriter::fourcc('m', 'p', '4', 'v')}
+    };
+    bool opened = false;
+    for (const auto& [name, fcc] : codecs) {
+        if (writer.open(path.string(), cv::CAP_FFMPEG, fcc, 30, cv::Size(1920, 1080))) {
+            std::cout << "Opened camera " << config.serial << " writer with codec " << name << " (CAP_FFMPEG)\n";
+            opened = true;
+            break;
+        }
+        if (writer.open(path.string(), fcc, 30, cv::Size(1920, 1080))) {
+            std::cout << "Opened camera " << config.serial << " writer with codec " << name << "\n";
+            opened = true;
+            break;
+        }
+    }
+    if (!opened)
+        throw std::runtime_error("Cannot open video writer for camera " + config.serial);
     pipeline->start(streamConfig);
     streaming = true;
 }
