@@ -92,9 +92,9 @@ class PlatformClient:
         target_url = upload_url
 
         if parsed_s3.hostname in ("localhost", "127.0.0.1") and parsed_base.hostname not in ("localhost", "127.0.0.1"):
-            # 预签名 URL 的主机为 localhost，但客户端从远端 IP 访问，需将目标重写为服务器 IP
+            # 预签名 URL 的主机为 localhost，但客户端从远端 IP 访问，需将目标重写为服务器 IP 与局域网代理端口 19001
             headers["Host"] = parsed_s3.netloc
-            s3_port = parsed_s3.port or 19000
+            s3_port = 19001 if (parsed_s3.port in (19000, 9000) or not parsed_s3.port) else parsed_s3.port
             target_netloc = f"{parsed_base.hostname}:{s3_port}"
             target_url = urllib.parse.urlunsplit((parsed_s3.scheme, target_netloc, parsed_s3.path, parsed_s3.query, parsed_s3.fragment))
 
