@@ -86,10 +86,22 @@ class PlatformClient:
             raise RuntimeError(f"平台接口调用失败 ({method} {path} HTTP {e.code}): {raw}") from None
 
     def put_part_to_s3(self, upload_url, data):
+        parsed_s3 = urllib.parse.urlsplit(upload_url)
+        parsed_base = urllib.parse.urlsplit(self.base_url)
+        headers = {"Content-Length": str(len(data))}
+        target_url = upload_url
+
+        if parsed_s3.hostname in ("localhost", "127.0.0.1") and parsed_base.hostname not in ("localhost", "127.0.0.1"):
+            # 预签名 URL 的主机为 localhost，但客户端从远端 IP 访问，需将目标重写为服务器 IP
+            headers["Host"] = parsed_s3.netloc
+            s3_port = parsed_s3.port or 19000
+            target_netloc = f"{parsed_base.hostname}:{s3_port}"
+            target_url = urllib.parse.urlunsplit((parsed_s3.scheme, target_netloc, parsed_s3.path, parsed_s3.query, parsed_s3.fragment))
+
         req = urllib.request.Request(
-            upload_url,
+            target_url,
             data=data,
-            headers={"Content-Length": str(len(data))},
+            headers=headers,
             method="PUT"
         )
         # S3 预签名直传不带平台鉴权 Header
