@@ -77,13 +77,16 @@ def record_one_segment(duration, segment_dir, config_path, recorder_bin, ffmpeg_
     segment_dir = Path(segment_dir)
     segment_dir.mkdir(parents=True, exist_ok=True)
     rec_work_dir = segment_dir / "raw_capture"
-    rec_work_dir.mkdir(parents=True, exist_ok=True)
+    # 确保录像工作目录在录制前不存在（medication_camera 会自身使用 create_directory 创建）
+    if rec_work_dir.exists():
+        shutil.rmtree(rec_work_dir, ignore_errors=True)
 
     captured_at = utc_now()
     raw_files = []
 
     if synthetic:
         # 合成模式：生成一个标准测试画面 MP4 (时长 duration 秒)
+        rec_work_dir.mkdir(parents=True, exist_ok=True)
         raw_target = rec_work_dir / "camera_1.raw.mp4"
         cmd = [
             ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
@@ -102,15 +105,29 @@ def record_one_segment(duration, segment_dir, config_path, recorder_bin, ffmpeg_
             else:
                 raise FileNotFoundError(f"未找到录像可执行程序: {recorder_bin}，请先编译 build/medication_camera")
 
-        cfg_file = Path(config_path).resolve()
-        # 如果配置文件不存在，自动生成默认单目/自动相机配置
-        if not cfg_file.exists():
-            cfg_file = segment_dir / "runtime_config.json"
-            cfg_file.write_text(json.dumps({
-                "duration_seconds": duration,
-                "cameras": [{"camera_number": 1, "serial": "auto"}]
-            }), encoding="utf-8")
+        # 生成规范的 OpenCV 录像配置 (medication_camera 仅需要 duration_seconds 与 cameras)
+        cfg_cameras = [{"camera_number": 1, "serial": "auto"}]
+        if config_path and Path(config_path).exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cdata = json.load(f)
+                    if "cameras" in cdata and isinstance(cdata["cameras"], list) and cdata["cameras"]:
+                        cfg_cameras = [
+                            {"camera_number": int(c.get("camera_number", 1)), "serial": str(c.get("serial", "auto"))}
+                            for c in cdata["cameras"]
+                        ]
+            except Exception:
+                pass
 
+        cfg_file = segment_dir / "recording-config.json"
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "duration_seconds": int(duration),
+                "cameras": cfg_cameras
+            }, f, indent=2)
+
+        # 注意：medication_camera 内部使用 std::filesystem::create_directory(argv[2]) 创建输出目录
+        # 因此 rec_work_dir 在调用前绝不能预先存在！
         cmd = [str(rec_bin), str(cfg_file), str(rec_work_dir)]
         subprocess.run(cmd, check=True, timeout=duration + 60)
         raw_files = sorted(list(rec_work_dir.glob("camera_*.raw.mp4")))
