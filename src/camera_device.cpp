@@ -55,7 +55,7 @@ RecordingResult CameraDevice::record(std::chrono::steady_clock::time_point deadl
     auto lastFrame = started;
     auto lastReport = started;
     int lastCount = 0;
-    while (!cancelled && std::chrono::steady_clock::now() < deadline) {
+    while (!cancelled && !g_stop_requested.load() && std::chrono::steady_clock::now() < deadline) {
         auto frames = pipeline->waitForFrameset(1000);
         auto frame = frames ? frames->getFrame(OB_FRAME_COLOR) : nullptr;
         if (!frame) {

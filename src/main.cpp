@@ -1,12 +1,24 @@
 #include "camera_manager.hpp"
 #include "manifest.hpp"
+#include <csignal>
 #include <filesystem>
 #include <future>
 #include <iostream>
 #include <set>
 #include <stdexcept>
 
+std::atomic<bool> g_stop_requested{false};
+
+namespace {
+void signalHandler(int /*signum*/) {
+    g_stop_requested.store(true);
+}
+}
+
 int main(int argc, char** argv) {
+    std::signal(SIGINT, signalHandler);
+    std::signal(SIGTERM, signalHandler);
+
     if (argc != 3) {
         std::cerr << "Usage: medication_camera CONFIG.json NEW_OUTPUT_DIRECTORY\n";
         return 2;

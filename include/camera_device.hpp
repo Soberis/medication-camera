@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 
+extern std::atomic<bool> g_stop_requested;
+
 struct CameraConfig {
     int number;
     std::string serial;

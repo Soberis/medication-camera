@@ -1,185 +1,254 @@
 # medication-camera
 
-RK3588 双 Gemini 335 RGB 录像与 medication-video-platform V2 上传客户端。
-相机硬件基线保持为 SDK v2.9.3、FW 1.8.10、1920×1080 MJPG / 30 FPS。
-本轮不改固件、USB、标定，不运行算法，也不上传 Depth。
+RK3588 边缘端多路音视频采集与配药合规质检云平台（`medication-video-platform`）对接流水线。
+
+专为医院药房、静配中心等严苛现场环境打造，支持 **开机无人值守定长切片录制** 与 **外部 IO 按钮 / USB 脚踏板 / 局域网 HTTP 事件驱动录制**，并提供断网无损暂存、定量/超时批量上传、磁盘空间自维护及开机 systemd 守护体系。
+
+---
+
+## 目录
+- [1. 核心特性与系统架构](#1-核心特性与系统架构)
+- [2. 快速部署指南（RK3588 工控机）](#2-快速部署指南rk3588-工控机)
+- [3. 配置参数详解](#3-配置参数详解)
+- [4. 录像模式与触发控制](#4-录像模式与触发控制)
+  - [模式 A：持续循环切片录制（默认）](#模式-a持续循环切片录制默认)
+  - [模式 B：GPIO 硬件引脚按键触发](#模式-bgpio-硬件引脚按键触发)
+  - [模式 C：USB 脚踏板 / 扫码枪按键触发](#模式-cusb-脚踏板--扫码枪按键触发)
+  - [模式 D：局域网 REST HTTP API 触发](#模式-d局域网-rest-http-api-触发)
+- [5. 运维与排障命令](#5-运维与排障命令)
+- [6. 本地自动化测试与模拟模式](#6-本地自动化测试与模拟模式)
+
+---
+
+## 1. 核心特性与系统架构
+
+### 架构拓扑与数据流向
 
 ```text
-config/edge.json
-  → C++ 双摄并发录像（按 SN 固定机位）
-  → FFmpeg 转 H.264 / yuv420p MP4
-  → 采集目录和不可变上传清单
-  → Python V2 manifest + multipart 直传 + CaptureGroup 收件结束
-  → 平台媒体检查、页面查看
+[Gemini 335 相机 / GPIO / 脚踏板]
+               │
+               ▼
+┌────────────────────────────────────────────────────────┐
+│  medication-record 服务 (tools/loop_recorder.py)       │
+│   • 驱动 Orbbec C++ 录像内核或 FFmpeg 合成录制          │
+│   • Web 标准化转码 (H.264 / yuv420p / +faststart)      │
+│   • 原子移入就绪池 (/data/spool/ready)                 │
+└────────────────────────────────────────────────────────┘
+               │  /data/spool/ready (解耦缓冲池)
+               ▼
+┌────────────────────────────────────────────────────────┐
+│  medication-uploader 服务 (tools/batch_uploader.py)    │
+│   • 3D 阈值触发：定量(N段) / 定容(X MB) / 超时(Y 秒)    │
+│   • 分片直传 (S3 Multipart) + 原子入库 CaptureGroup    │
+│   • 断网自动重试、事务安全回退、磁盘空间过期清理 (FIFO)│
+└────────────────────────────────────────────────────────┘
+               │  HTTP / S3
+               ▼
+[medication-video-platform 配药质检云平台]
 ```
 
-## 1. 在工控机更新、编译
+### 本地缓冲池（Spooling Pool）状态机
+- `/data/spool/recording/`：正在录制的切片临时工作目录。
+- `/data/spool/ready/`：录制且转码完成、元数据验证完毕的待上传切片。
+- `/data/spool/uploading/`：当前正由上传进程搬运并提交至云平台的切片批次。
+- `/data/spool/completed/`：已成功入库并归档的历史切片（按保留策略自动淘汰）。
 
-先在工控机的仓库目录检查 `git status --short`。有本地修改时先保留，不要 reset 或覆盖。
-以下操作由操作者执行；拉取、编译不会启动相机。
+---
+
+## 2. 快速部署指南（RK3588 工控机）
+
+### 2.1 依赖环境要求
+- **系统**：Ubuntu 20.04 / 22.04 LTS (aarch64 / ARM64)
+- **依赖库**：`build-essential cmake libopencv-dev ffmpeg python3`
+- **硬件 SDK**：Orbbec SDK v2.9.3（预装于 `/opt/orbbec/...`）
+
+### 2.2 编译底层 C++ 录像内核
+在 RK3588 终端执行：
 
 ```bash
 cd /home/firefly/projects/medication-camera
-git pull --ff-only
+
+# 1. 编译 C++ 录像程序
 cmake -S . -B build \
   -DORBBEC_SDK_PATH=/opt/orbbec/OrbbecSDK_v2.9.3_202607151523_2f6561c_linux_arm64
-cmake --build build -j2
-python3 --version
-ffmpeg -version
+cmake --build build -j$(nproc)
+
+# 2. 验证生成产物
+./build/medication_camera
+# 正常应输出: Usage: medication_camera CONFIG.json NEW_OUTPUT_DIRECTORY
 ```
 
-如实际仓库位于其他目录，替换第一行。依赖是 C++17 编译器、CMake、OpenCV
-（core/imgcodecs/videoio）、现有 Orbbec SDK、Python 3.8+、带 libx264 的 FFmpeg。
-Python 客户端没有第三方运行时依赖。Ubuntu 缺少依赖时可安装
-`build-essential cmake libopencv-dev ffmpeg python3`，不需要重新安装已验证的 SDK。
-
-## 2. 让工控机访问本地平台
-
-平台项目先按自身 `scripts/start-local.ps1` 启动 Core API、对象存储和 Media Worker。
-首次测试只拍摄测试物品，使用隔离开发项目；不要使用真实患者数据。
-
-**首轮可使用 SSH 反向隧道，无需把数据库或对象存储开放到局域网。**
-在运行平台的 Windows 电脑单独打开终端执行，并保持该连接：
-
-```powershell
-ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 18080:127.0.0.1:8080 -R 19000:127.0.0.1:19000 root@192.168.5.5
-```
-
-此示例假定平台 API 位于本机 8080、平台的 `S3_ENDPOINT=http://localhost:19000`，
-且对象存储实际监听 19000。工控机配置 `platform_base_url=http://127.0.0.1:18080`。
-预签名 URL 中的 `localhost:19000` 会通过第二条隧道抵达 Windows 对象存储。
-如果你的平台使用默认 9000，第二条参数改为 `-R 9000:127.0.0.1:9000`；
-**远端监听端口必须与 S3_ENDPOINT/签名 URL 中的端口一致。** 不要修改返回的签名 URL。
-API 端口不同也应相应修改。SSH 登录密码由 SSH 交互输入，不放进配置或脚本。
-
-长期部署可改用 LAN/HTTPS：API 和对象存储都必须可从工控机访问，平台签名时就应使用
-可达的对象存储地址。仅改 API 地址不够。此仓库不会改动平台的监听、防火墙或凭据。
-
-## 3. 配置机位与平台 ID（首次部署）
+### 2.3 一键安装开机自启系统服务
+运行自带的部署脚本即可自动创建缓冲池目录并注册为 systemd 系统守护服务：
 
 ```bash
-cp config/edge.example.json config/edge.json
+sudo bash deploy/install_edge.sh
 ```
 
-编辑 `config/edge.json`：
+脚本将自动激活并启动两个后台独立服务：
+- `medication-record.service`：音视频切片录制守护进程。
+- `medication-uploader.service`：定量批量上传守护进程。
 
-- `platform_base_url`：根据上面的隧道或 LAN 方案填写。示例文件的 `192.168.5.10` 只是占位地址。
-- `project_id`：平台项目的 UUID。平台默认 local synthetic 项目为
-  `00000000-0000-0000-0000-000000000001`，如部署改过则使用实际值。
-- `device_id`：该工控机的稳定部署编号；不是相机 SN。
-- `camera_number=1` 固定到 `CP0F463000J6`，`camera_number=2` 固定到 `CP0F463000L6`。
-- `camera_role`、`mount_position`：按实际安装位置填写；示例的 OVERVIEW/HANDS 是待核对配置，
-  不是已经确认的物理位置。相机编号不因枚举顺序或缺失而变化。
-- `duration_seconds`：首轮建议 10 秒；当前允许 1～3600 秒。
-- `allow_http=true` 仅用于受控本地联调，HTTPS 部署设为 false。
+---
 
-管理员一次性配置 CameraChannel / CameraSet。令牌从当前平台开发环境取得，
-不要把医院凭据或生产密钥带入本地测试。Bash 可用隐藏输入：
+## 3. 配置参数详解
 
+核心配置文件位于 `config/edge_continuous.json`：
+
+```json
+{
+  "platform_base_url": "http://192.168.5.100:8080",
+  "project_id": "f6f7c6b9-05c9-4582-b7d3-f623791a00d3",
+  "device_id": "rk3588-hospital-01",
+  "spool_dir": "/data/spool",
+  "duration_seconds": 180,
+  "batch_count": 5,
+  "batch_size_mb": 500,
+  "max_delay_seconds": 1800,
+  "poll_interval": 5,
+  "retention_hours": 48,
+  "min_disk_free_gb": 10,
+  "username": "admin",
+  "password": "admin12345678",
+  "trigger": {
+    "mode": "loop",
+    "max_duration_seconds": 300,
+    "gpio": {
+      "chip": 1,
+      "line": 12,
+      "active_low": true,
+      "debounce_ms": 50
+    },
+    "usb_hid": {
+      "key_code": 57,
+      "debounce_ms": 100
+    },
+    "http": {
+      "host": "0.0.0.0",
+      "port": 8090
+    }
+  },
+  "cameras": [
+    {
+      "camera_number": 1,
+      "serial": "auto",
+      "camera_role": "OVERVIEW",
+      "mount_position": "camera-1"
+    }
+  ]
+}
+```
+
+### 关键配置项说明
+
+| 参数项 | 类型 | 默认值 | 作用说明 |
+| :--- | :--- | :--- | :--- |
+| `platform_base_url` | String | `http://<IP>:8080` | 云平台后端 API 基础地址 |
+| `project_id` | UUID | - | 视频归属项目的 UUID（进入 Web 端项目列表即可获取） |
+| `device_id` | String | `rk3588-hospital-01` | 工控机唯一设备标识符 |
+| `duration_seconds` | Integer | `180` | 单切片时长（秒）。3 分钟即为 180 秒；快速联调可设为 15 |
+| `batch_count` | Integer | `5` | **数量阈值**：就绪切片积攒满 N 段立即触发批量上传（设为 1 则每段录完立即传） |
+| `batch_size_mb` | Integer | `500` | **容量阈值**：就绪切片累计体积达 X MB 立即触发上传 |
+| `max_delay_seconds`| Integer | `1800` | **超时保底**：首个就绪切片等待超过 Y 秒强制触发上传 |
+| `retention_hours` | Integer | `48` | 已完成切片在本地磁盘保留时间（小时），超时自动清理 |
+| `min_disk_free_gb` | Integer | `10` | 磁盘最低安全剩余空间（GB），低于此阈值执行 FIFO 紧急释放 |
+
+---
+
+## 4. 录像模式与触发控制
+
+在 `config/edge_continuous.json` 中配置 `"trigger": { "mode": "..." }` 即可按需切换：
+
+### 模式 A：持续循环切片录制（默认）
+- **配置**：`"mode": "loop"`
+- **行为**：工控机开机后持续无缝录制 3 分钟定长切片，切片转码完成后原子送入缓冲池，随后立即录制下一段。无需现场人工干预。
+
+### 模式 B：GPIO 硬件引脚按键触发
+- **配置**：`"mode": "gpio"`
+- **行为**：医护人员在配药台按下硬件自复位按键开启录像，配药完毕再次按下保存切片并就绪上传。
+- **硬件保护**：
+  - 内置 50ms 软件防抖，彻底消除物理按键杂波。
+  - 内置 `max_duration_seconds` 防呆保护机制（如 5 分钟超时自动截断保存，防止误忘按停导致录像持续占满磁盘）。
+
+### 模式 C：USB 脚踏板 / 扫码枪按键触发
+- **配置**：`"mode": "usb_hid"`
+- **行为**：操作者踩下 USB 医疗脚踏板（如输入 Space/空格键或回车键）启动录像，再次踩下结束录像。
+
+### 模式 D：局域网 REST HTTP API 触发
+- **配置**：`"mode": "http"`
+- **行为**：提供轻量级局域网 HTTP 控制接口（默认监听 `8090` 端口），可供医院 HIS 系统、配药台平板或第三方中控联动：
+  - **启动录制**：
+    ```bash
+    curl -X POST http://192.168.5.5:8090/api/trigger/start
+    ```
+  - **停止录制并保存**：
+    ```bash
+    curl -X POST http://192.168.5.5:8090/api/trigger/stop
+    ```
+  - **查看当前录制状态**：
+    ```bash
+    curl http://192.168.5.5:8090/api/trigger/status
+    ```
+
+---
+
+## 5. 运维与排障命令
+
+### 5.1 服务状态与实时日志
 ```bash
-read -rsp 'Platform admin token: ' PLATFORM_ADMIN_TOKEN; echo
-export PLATFORM_ADMIN_TOKEN
-python3 tools/edge.py provision --config config/edge.json
-unset PLATFORM_ADMIN_TOKEN
+# 查看录像与上传服务运行状态
+sudo systemctl status medication-record
+sudo systemctl status medication-uploader
+
+# 实时追踪录像日志
+journalctl -u medication-record -f
+
+# 实时追踪批量上传日志
+journalctl -u medication-uploader -f
 ```
 
-此命令只配置平台逻辑机位，不启动相机。生成的 `camera_channel_id`、`camera_set_id`
-写回未跟踪的本地配置，令牌不保存。也可以由平台管理员在其他机器完成配置后填写准确 ID。
-同一 CameraSet 版本不可变；变更成员或角色时提高 `configuration_version` 后重新配置。
-
-## 4. 拍摄并准备上传
-
-**以下 `record` 命令会启动真实相机，由操作者执行。**
-
+### 5.2 查看缓冲池中切片积攒情况
 ```bash
-python3 tools/edge.py record --config config/edge.json
+# 查看待上传切片
+ls -lh /data/spool/ready
+
+# 查看已上传切片归档
+ls -lh /data/spool/completed
 ```
 
-命令输出唯一的 `Task: .../spool/<UUID>`。两路并发录像，完成后顺序转码；
-仅当两台录像和转码全部成功，才生成 `upload-state.json`。没有自动上传。
-
-```text
-spool/<UUID>/
-├── task.json                 # 采集组 ID、采集开始时间、冻结配置
-├── recording-config.json
-├── recording/
-│   ├── camera_1.raw.mp4       # 原始 OpenCV 录像，保留
-│   ├── camera_2.raw.mp4
-│   └── capture-result.json   # 仅成功时存在；帧数、超时、首帧主机 UTC、耗时
-├── camera_1.mp4              # H.264 上传文件
-├── camera_2.mp4
-├── metadata.json
-├── event-log.ndjson
-├── manifest.json             # external-video-ingest-v2
-└── upload-state.json         # 身份、文件摘要、平台返回 ID；不保存令牌或签名 URL
-```
-
-如只有转码/准备失败，修复环境后可继续同一目录，不必重拍：
-
+### 5.3 重启或停止服务
 ```bash
-python3 tools/edge.py prepare spool/<UUID>
+# 重启录像流水线（修改配置后）
+sudo systemctl restart medication-record
+sudo systemctl restart medication-uploader
+
+# 停用开机自启
+sudo systemctl disable medication-record medication-uploader
 ```
 
-如录像失败，该目录保留诊断材料且不可上传；修复后重新执行 `record` 创建新任务。
-不要手工伪造完成标记。两台缺任一台会明确失败，本轮不实现缺路降级上传。
+---
 
-## 5. 上传与检查
+## 6. 本地自动化测试与模拟模式
 
-使用具备项目上传权限的令牌，通常对应平台 local 环境的 `DEV_BEARER_TOKEN`：
+在未连接物理摄像头或非 ARM 开发机（如 Windows / Linux x86）上，可直接利用 `--synthetic` 模式和单元测试验证全流水线闭环：
 
+### 运行全量单元测试套件
 ```bash
-read -rsp 'Platform upload token: ' PLATFORM_TOKEN; echo
-export PLATFORM_TOKEN
-python3 tools/edge.py upload spool/<UUID>
-python3 tools/edge.py status spool/<UUID>
-unset PLATFORM_TOKEN
+# 包含触发器子系统、防抖逻辑、HTTP 控制、流式转码、多维阈值上传等 18 项自动化测试
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-`upload` 成功表示文件和数据组收件完成；`status` 显示各机位的媒体状态。
-`status` 在收件 COMPLETE 且两路均 INGESTED 时退出 0，尚未就绪退出 2，请稍后重查；
-请求/配置失败退出 1。最后在平台页面打开对应数据组，确认两段视频可以播放。
-
-完整协议（统一前缀 `/api/v1`）：
-
-1. POST `/projects/{projectId}/external-video-ingest-manifests/v2`，初始不结束收件。
-2. POST `/upload/init`，绑定 manifest，声明完整文件清单的规范摘要。
-3. PUT `/upload/{batchId}/files/{clientFileId}`，先注册全部 4 个文件。
-4. 每文件创建 multipart；申请 Part URL、直传对象存储、确认 Part、完成 File。
-5. 完成 Batch，组装 CaptureSession，核对所有视频绑定。
-6. POST 数据组 `receipt/finalize`，检查 COMPLETE 与机位集合。
-
-上传失败后重复相同 `upload` 命令。任务复用相同 group key、batch 幂等键和 file ID；
-服务器协调已传但未确认的分片，内存中一次只读取 8 MiB，不整段加载大视频。
-响应丢失、进程退出后可续传；平台 batch 已 EXPIRED/ABORTED/FAILED 时停止，保留文件供人工处理，
-不自动新建重复组。文件大小或 SHA-256 改变时拒绝上传。
-单个任务有进程锁，系统会在进程退出时释放；不要手工删除正在使用的 `.lock`。
-
-## 验证与当前边界
-
+### 手动单步模拟录像与上传
 ```bash
-python3 -m unittest discover -s tests -v
+# 1. 模拟录制 2 段 5 秒切片
+python tools/loop_recorder.py \
+    --duration 5 \
+    --spool /data/spool \
+    --synthetic \
+    --max-segments 2
+
+# 2. 模拟单次批量上传
+python tools/batch_uploader.py \
+    --config config/edge_continuous.json \
+    --once
 ```
-
-测试覆盖分片和控制面响应丢失恢复、幂等重试、摘要冲突、过期任务、机位配置、进程锁、
-令牌隔离，以及 FFmpeg 合成视频转码。媒体测试需要 FFmpeg/ffprobe。
-
-真实服务合成验收（**只对隔离的 local/test 平台执行**，会创建合成 CameraSet、数据组和文件）：
-
-```bash
-export RUN_CAMERA_UPLOAD_E2E=1
-export CAMERA_TEST_BASE_URL=http://localhost:28080
-# 通过环境设置 PLATFORM_ADMIN_TOKEN、PLATFORM_TOKEN；不从命令参数传令牌。
-python3 tests/e2e_upload.py
-```
-
-该工具不接收源视频路径、不连接相机，自动生成两段 1080p 合成视频，测试传完首个 Part
-但未确认时中断，再恢复并重复提交，最终等待 Media Probe。合成证据保存在 `.runtime/`。
-
-当前明确边界：
-
-- C++ 需在具备 OrbbecSDK / OpenCV 的 ARM 工控机实际编译与验收；Python/合成测试不能代替硬件结果。
-- 录像使用 30 FPS CFR，掉帧会使媒体时长短于实际采集时长；完成标记保留实际帧数和主机耗时。
-  `sync_status=UNKNOWN`，`time_offset_ms=0` 是未测量占位，不是硬件同步或精确对齐证明。
-- 未实现常驻服务、自动重连、磁盘自动清理、硬件编码、Depth 上传或 AI。原始及转码文件都保留，
-  长时间采集前确认空间；本轮先用短片验收。
-- 开发平台的本地 bearer 身份是联调机制；正式部署的设备认证与凭据轮换须按平台部署方案另行配置。

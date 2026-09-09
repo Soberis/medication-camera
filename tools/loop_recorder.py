@@ -62,39 +62,42 @@ def calc_sha256(path, chunk_size=8 * 1024 * 1024):
 
 def transcode_video(raw_path, output_path, ffmpeg_bin="ffmpeg"):
     """使用 FFmpeg 将 raw 视频转码为 H.264 / yuv420p 标准 Web MP4"""
+    ff_cmd = shutil.which(ffmpeg_bin) or ffmpeg_bin
     cmd = [
-        ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        str(ff_cmd), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(raw_path),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         str(output_path)
     ]
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"[RECORDER] [WARN] FFmpeg 转码不可用 ({e})，降级直接复制原始文件...", file=sys.stderr)
+        shutil.copyfile(raw_path, output_path)
 
 
-def record_one_segment(duration, segment_dir, config_path, recorder_bin, ffmpeg_bin, synthetic=False):
-    """录制单个切片并转码，写入 segment_meta.json"""
+def launch_recorder_process(duration, segment_dir, config_path, recorder_bin, ffmpeg_bin, synthetic=False):
+    """启动底层录像进程 (非阻塞，返回 Popen 对象、录像工作目录及捕获起始时间)"""
     segment_dir = Path(segment_dir)
     segment_dir.mkdir(parents=True, exist_ok=True)
     rec_work_dir = segment_dir / "raw_capture"
-    # 确保录像工作目录在录制前不存在（medication_camera 会自身使用 create_directory 创建）
     if rec_work_dir.exists():
         shutil.rmtree(rec_work_dir, ignore_errors=True)
 
     captured_at = utc_now()
-    raw_files = []
 
     if synthetic:
         # 合成模式：生成一个标准测试画面 MP4 (时长 duration 秒)
         rec_work_dir.mkdir(parents=True, exist_ok=True)
         raw_target = rec_work_dir / "camera_1.raw.mp4"
+        ff_cmd = shutil.which(ffmpeg_bin) or ffmpeg_bin
         cmd = [
-            ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            str(ff_cmd), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "lavfi", "-i", f"testsrc=duration={duration}:size=1920x1080:rate=30",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", str(raw_target)
         ]
-        subprocess.run(cmd, check=True)
-        raw_files = [raw_target]
+        proc = subprocess.Popen(cmd)
     else:
         # 调用 C++ medication_camera 录像
         rec_bin = Path(recorder_bin).resolve()
@@ -129,10 +132,18 @@ def record_one_segment(duration, segment_dir, config_path, recorder_bin, ffmpeg_
         # 注意：medication_camera 内部使用 std::filesystem::create_directory(argv[2]) 创建输出目录
         # 因此 rec_work_dir 在调用前绝不能预先存在！
         cmd = [str(rec_bin), str(cfg_file), str(rec_work_dir)]
-        subprocess.run(cmd, check=True, timeout=duration + 60)
-        raw_files = sorted(list(rec_work_dir.glob("camera_*.raw.mp4")))
-        if not raw_files:
-            raise RuntimeError("录像程序退出，但未在工作目录产生 camera_*.raw.mp4")
+        proc = subprocess.Popen(cmd)
+
+    return proc, rec_work_dir, captured_at
+
+
+def finalize_segment(segment_dir, rec_work_dir, captured_at, duration, ffmpeg_bin):
+    """录像进程退出后，转码所有原始流并生成 segment_meta.json"""
+    segment_dir = Path(segment_dir)
+    rec_work_dir = Path(rec_work_dir)
+    raw_files = sorted(list(rec_work_dir.glob("camera_*.raw.mp4")))
+    if not raw_files:
+        raise RuntimeError("录像程序退出，但未在工作目录产生 camera_*.raw.mp4")
 
     # 转码所有摄像头原始视频
     video_entries = []
@@ -170,6 +181,22 @@ def record_one_segment(duration, segment_dir, config_path, recorder_bin, ffmpeg_
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
     return meta
+
+
+def record_one_segment(duration, segment_dir, config_path, recorder_bin, ffmpeg_bin, synthetic=False):
+    """录制单个切片并转码（阻塞直到完成），写入 segment_meta.json"""
+    proc, rec_work_dir, captured_at = launch_recorder_process(
+        duration, segment_dir, config_path, recorder_bin, ffmpeg_bin, synthetic=synthetic
+    )
+    try:
+        ret = proc.wait(timeout=duration + 60)
+        if ret != 0:
+            raise RuntimeError(f"录像进程异常退出 (exit code {ret})")
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise
+
+    return finalize_segment(segment_dir, rec_work_dir, captured_at, duration, ffmpeg_bin)
 
 
 def main():
@@ -266,11 +293,12 @@ def main():
         # 事件驱动触发模式 (GPIO / USB 脚踏板 / HTTP)
         from tools.triggers import TriggerManager
 
+        max_dur = args.max_duration or cfg.get("trigger", {}).get("max_duration_seconds", 300)
         trigger_cfg = {
             "duration_seconds": duration,
             "trigger": {
                 "mode": trigger_mode,
-                "max_duration_seconds": args.max_duration or cfg.get("trigger", {}).get("max_duration_seconds", 300),
+                "max_duration_seconds": max_dur,
                 **cfg.get("trigger", {})
             }
         }
@@ -279,38 +307,62 @@ def main():
         active_session = {}
 
         def handle_start(event):
-            nonlocal segments_recorded
             session_id = event.metadata.get("session_id") or f"session_{uuid.uuid4().hex[:8]}"
             working_dir = recording_dir / session_id
-            print(f"\n[RECORDER] [TRIGGER-EVENT] 开始录像会话: {session_id}")
-            active_session["dir"] = working_dir
-            active_session["id"] = session_id
-            active_session["meta"] = event.metadata
-            active_session["start_time"] = time.time()
-
-        def handle_stop(event):
-            nonlocal segments_recorded
-            if "dir" not in active_session:
-                return
-            working_dir = active_session.pop("dir")
-            session_id = active_session.pop("id")
-            meta_info = active_session.pop("meta", {})
-            elapsed = time.time() - active_session.pop("start_time", time.time())
-            record_seconds = max(1, int(elapsed))
-
-            target_ready_dir = ready_dir / session_id
-            print(f"[RECORDER] [TRIGGER-EVENT] 正在完成会话并转码: {session_id} (时长: {record_seconds}s)...")
+            print(f"\n[RECORDER] [TRIGGER-EVENT] 接收到录制启动信号: {session_id}")
             try:
-                meta = record_one_segment(
-                    duration=record_seconds,
+                proc, rec_work_dir, captured_at = launch_recorder_process(
+                    duration=max_dur,
                     segment_dir=working_dir,
                     config_path=args.config,
                     recorder_bin=args.recorder,
                     ffmpeg_bin=args.ffmpeg,
                     synthetic=args.synthetic
                 )
+                active_session["proc"] = proc
+                active_session["dir"] = working_dir
+                active_session["rec_work_dir"] = rec_work_dir
+                active_session["id"] = session_id
+                active_session["captured_at"] = captured_at
+                active_session["meta"] = event.metadata
+                active_session["start_time"] = time.time()
+                print(f"[RECORDER] [TRIGGER-EVENT] 录像进程已启动 (PID {proc.pid})")
+            except Exception as err:
+                print(f"[RECORDER] [ERROR] 启动底层录像失败: {err}", file=sys.stderr)
+                shutil.rmtree(working_dir, ignore_errors=True)
+                active_session.clear()
+
+        def handle_stop(event):
+            nonlocal segments_recorded
+            if "proc" not in active_session:
+                return
+            proc = active_session.pop("proc")
+            working_dir = active_session.pop("dir")
+            rec_work_dir = active_session.pop("rec_work_dir")
+            session_id = active_session.pop("id")
+            captured_at = active_session.pop("captured_at")
+            meta_info = active_session.pop("meta", {})
+            elapsed = time.time() - active_session.pop("start_time", time.time())
+            record_seconds = max(1, int(elapsed))
+
+            target_ready_dir = ready_dir / session_id
+            print(f"\n[RECORDER] [TRIGGER-EVENT] 接收到停止信号，正在完成会话并转码: {session_id} (实际时长: {record_seconds}s)...")
+
+            # 发送优雅停机信号
+            if proc.poll() is None:
+                try:
+                    if os.name == "nt":
+                        proc.terminate()
+                    else:
+                        proc.send_signal(signal.SIGINT)
+                    proc.wait(timeout=10)
+                except Exception:
+                    proc.kill()
+                    proc.wait(timeout=2)
+
+            try:
+                meta = finalize_segment(working_dir, rec_work_dir, captured_at, record_seconds, args.ffmpeg)
                 meta["trigger_metadata"] = meta_info
-                # 更新元数据文件
                 with open(working_dir / "segment_meta.json", "w", encoding="utf-8") as f:
                     json.dump(meta, f, indent=2, ensure_ascii=False)
 
@@ -330,9 +382,16 @@ def main():
                 if args.max_segments > 0 and segments_recorded >= args.max_segments:
                     print(f"[RECORDER] 已达到最大切片数限制 ({args.max_segments})，结束退出。")
                     break
+                # 底层录像自然达到最大时长退出时，主动触发 notify_stop
+                if "proc" in active_session and active_session["proc"].poll() is not None:
+                    trigger.notify_stop(reason="DURATION_FINISHED")
                 time.sleep(0.2)
         finally:
             trigger.stop_listening()
+            if "proc" in active_session:
+                p = active_session.get("proc")
+                if p and p.poll() is None:
+                    p.kill()
 
     print("[RECORDER] 录像守护进程已安全停止。")
 
