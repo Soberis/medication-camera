@@ -7,9 +7,8 @@ Type=simple
 User=root
 WorkingDirectory=/home/firefly/projects/medication-camera
 ExecStart=/usr/bin/python3 -u tools/loop_recorder.py \
-    --duration 180 \
-    --spool /data/spool \
     --config config/edge_continuous.json \
+    --spool /data/spool \
     --recorder build/medication_camera
 Restart=always
 RestartSec=3s
