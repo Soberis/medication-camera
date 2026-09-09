@@ -22,6 +22,11 @@ import sys
 import time
 import uuid
 
+# 确保项目根目录在 sys.path 中
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -162,9 +167,24 @@ def main():
     parser.add_argument("--recorder", default="build/medication_camera", help="C++ 录像程序路径")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="FFmpeg 可执行路径")
     parser.add_argument("--synthetic", action="store_true", help="使用 FFmpeg 合成画面模式(调试用，无需相机硬件)")
+    parser.add_argument("--trigger-mode", choices=["loop", "gpio", "usb_hid", "http"], help="触发模式: loop (持续循环) | gpio (引脚按键) | usb_hid (USB脚踏) | http (REST接口)")
+    parser.add_argument("--max-duration", type=int, help="单次录制最大时长限制(秒)")
     parser.add_argument("--max-segments", type=int, default=0, help="最多录制切片数量(0 表示无限循环)")
 
     args = parser.parse_args()
+
+    # 读取配置文件
+    cfg_file = Path(args.config) if args.config else None
+    cfg = {}
+    if cfg_file and cfg_file.exists():
+        try:
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+
+    trigger_mode = args.trigger_mode or cfg.get("trigger", {}).get("mode", "loop")
+    duration = args.duration or cfg.get("duration_seconds", 180)
 
     spool_dir = Path(args.spool).resolve()
     recording_dir = spool_dir / "recording"
@@ -173,56 +193,129 @@ def main():
     ready_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 65)
-    print(" [RECORDER] RK3588 持续切片录像守护进程启动")
-    print(f"   * 切片时长:     {args.duration} 秒 ({args.duration / 60:.1f} 分钟)")
+    print(" [RECORDER] RK3588 切片录像守护进程启动")
+    print(f"   * 触发模式:     {trigger_mode}")
+    print(f"   * 切片时长:     {duration} 秒 ({duration / 60:.1f} 分钟)")
     print(f"   * 暂存就绪目录: {ready_dir}")
     print(f"   * 录像后端:     {'FFmpeg 合成模拟' if args.synthetic else args.recorder}")
     print("=" * 65)
 
     segments_recorded = 0
 
-    while RUNNING:
-        if args.max_segments > 0 and segments_recorded >= args.max_segments:
-            print(f"[RECORDER] 已达到最大切片数限制 ({args.max_segments})，结束录制。")
-            break
+    if trigger_mode == "loop":
+        # 持续循环录制模式
+        while RUNNING:
+            if args.max_segments > 0 and segments_recorded >= args.max_segments:
+                print(f"[RECORDER] 已达到最大切片数限制 ({args.max_segments})，结束录制。")
+                break
 
-        timestamp_str = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        segment_id = f"segment_{timestamp_str}_{uuid.uuid4().hex[:6]}"
-        working_segment_dir = recording_dir / segment_id
-        target_ready_dir = ready_dir / segment_id
+            timestamp_str = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+            segment_id = f"segment_{timestamp_str}_{uuid.uuid4().hex[:6]}"
+            working_segment_dir = recording_dir / segment_id
+            target_ready_dir = ready_dir / segment_id
 
-        print(f"\n[RECORDER] 开始录制切片 #{segments_recorded + 1}: {segment_id} ({args.duration}s)...")
-        start_t = time.time()
+            print(f"\n[RECORDER] 开始录制切片 #{segments_recorded + 1}: {segment_id} ({duration}s)...")
+            start_t = time.time()
+
+            try:
+                meta = record_one_segment(
+                    duration=duration,
+                    segment_dir=working_segment_dir,
+                    config_path=args.config,
+                    recorder_bin=args.recorder,
+                    ffmpeg_bin=args.ffmpeg,
+                    synthetic=args.synthetic
+                )
+                elapsed = time.time() - start_t
+
+                os.replace(working_segment_dir, target_ready_dir)
+                segments_recorded += 1
+
+                total_size_mb = sum(v["size_bytes"] for v in meta["videos"]) / (1024 * 1024)
+                print(f"[RECORDER] [OK] 切片就绪: {segment_id} (耗时: {elapsed:.1f}s, 大小: {total_size_mb:.2f} MB)")
+                print(f"           移动至 -> {target_ready_dir}")
+
+            except subprocess.TimeoutExpired:
+                print(f"[RECORDER] [WARN] 录像超时异常，清理临时切片: {working_segment_dir}", file=sys.stderr)
+                shutil.rmtree(working_segment_dir, ignore_errors=True)
+                time.sleep(2)
+            except Exception as e:
+                print(f"[RECORDER] [ERROR] 录制失败: {e}", file=sys.stderr)
+                shutil.rmtree(working_segment_dir, ignore_errors=True)
+                if not RUNNING:
+                    break
+                time.sleep(3)
+    else:
+        # 事件驱动触发模式 (GPIO / USB 脚踏板 / HTTP)
+        from tools.triggers import TriggerManager
+
+        trigger_cfg = {
+            "duration_seconds": duration,
+            "trigger": {
+                "mode": trigger_mode,
+                "max_duration_seconds": args.max_duration or cfg.get("trigger", {}).get("max_duration_seconds", 300),
+                **cfg.get("trigger", {})
+            }
+        }
+        trigger = TriggerManager.create(trigger_cfg)
+
+        active_session = {}
+
+        def handle_start(event):
+            nonlocal segments_recorded
+            session_id = event.metadata.get("session_id") or f"session_{uuid.uuid4().hex[:8]}"
+            working_dir = recording_dir / session_id
+            print(f"\n[RECORDER] [TRIGGER-EVENT] 开始录像会话: {session_id}")
+            active_session["dir"] = working_dir
+            active_session["id"] = session_id
+            active_session["meta"] = event.metadata
+            active_session["start_time"] = time.time()
+
+        def handle_stop(event):
+            nonlocal segments_recorded
+            if "dir" not in active_session:
+                return
+            working_dir = active_session.pop("dir")
+            session_id = active_session.pop("id")
+            meta_info = active_session.pop("meta", {})
+            elapsed = time.time() - active_session.pop("start_time", time.time())
+            record_seconds = max(1, int(elapsed))
+
+            target_ready_dir = ready_dir / session_id
+            print(f"[RECORDER] [TRIGGER-EVENT] 正在完成会话并转码: {session_id} (时长: {record_seconds}s)...")
+            try:
+                meta = record_one_segment(
+                    duration=record_seconds,
+                    segment_dir=working_dir,
+                    config_path=args.config,
+                    recorder_bin=args.recorder,
+                    ffmpeg_bin=args.ffmpeg,
+                    synthetic=args.synthetic
+                )
+                meta["trigger_metadata"] = meta_info
+                # 更新元数据文件
+                with open(working_dir / "segment_meta.json", "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2, ensure_ascii=False)
+
+                os.replace(working_dir, target_ready_dir)
+                segments_recorded += 1
+                total_mb = sum(v["size_bytes"] for v in meta["videos"]) / (1024 * 1024)
+                print(f"[RECORDER] [OK] 事件录制切片已就绪: {session_id} ({total_mb:.2f} MB)")
+                print(f"           移动至就绪池 -> {target_ready_dir}")
+            except Exception as e:
+                print(f"[RECORDER] [ERROR] 处理会话失败: {e}", file=sys.stderr)
+                shutil.rmtree(working_dir, ignore_errors=True)
+
+        trigger.start_listening(on_start=handle_start, on_stop=handle_stop)
 
         try:
-            meta = record_one_segment(
-                duration=args.duration,
-                segment_dir=working_segment_dir,
-                config_path=args.config,
-                recorder_bin=args.recorder,
-                ffmpeg_bin=args.ffmpeg,
-                synthetic=args.synthetic
-            )
-            elapsed = time.time() - start_t
-
-            # 原子移动至 ready 目录
-            os.replace(working_segment_dir, target_ready_dir)
-            segments_recorded += 1
-
-            total_size_mb = sum(v["size_bytes"] for v in meta["videos"]) / (1024 * 1024)
-            print(f"[RECORDER] [OK] 切片就绪: {segment_id} (耗时: {elapsed:.1f}s, 大小: {total_size_mb:.2f} MB)")
-            print(f"           移动至 -> {target_ready_dir}")
-
-        except subprocess.TimeoutExpired:
-            print(f"[RECORDER] [WARN] 录像超时异常，清理临时切片: {working_segment_dir}", file=sys.stderr)
-            shutil.rmtree(working_segment_dir, ignore_errors=True)
-            time.sleep(2)
-        except Exception as e:
-            print(f"[RECORDER] [ERROR] 录制失败: {e}", file=sys.stderr)
-            shutil.rmtree(working_segment_dir, ignore_errors=True)
-            if not RUNNING:
-                break
-            time.sleep(3)
+            while RUNNING:
+                if args.max_segments > 0 and segments_recorded >= args.max_segments:
+                    print(f"[RECORDER] 已达到最大切片数限制 ({args.max_segments})，结束退出。")
+                    break
+                time.sleep(0.2)
+        finally:
+            trigger.stop_listening()
 
     print("[RECORDER] 录像守护进程已安全停止。")
 
