@@ -1,0 +1,20 @@
+[Unit]
+Description=Medication Camera Batch Uploader Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/firefly/projects/medication-camera
+ExecStart=/usr/bin/python3 -u tools/batch_uploader.py \
+    --config config/edge_continuous.json
+Restart=always
+RestartSec=10s
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

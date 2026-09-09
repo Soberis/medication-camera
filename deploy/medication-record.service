@@ -1,0 +1,22 @@
+[Unit]
+Description=Medication Camera Continuous Segment Recorder (3min)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/firefly/projects/medication-camera
+ExecStart=/usr/bin/python3 -u tools/loop_recorder.py \
+    --duration 180 \
+    --spool /data/spool \
+    --config config/edge_continuous.json \
+    --recorder build/medication_camera
+Restart=always
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
