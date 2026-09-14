@@ -31,11 +31,11 @@ def config():
 def upload_fixture(directory):
     files = []
     # More than one full part, plus a tail: verifies actual resume across part boundaries.
-    for index, data in enumerate([b"a" * (edge.PART_SIZE + 37), b"second-video", b"{}", b"{}\n"]):
+    for index, data in enumerate([b"a" * (edge.PART_SIZE + 37), b"second-video", b"{}"]):
         name = f"synthetic-{index}.dat"
         (directory / name).write_bytes(data)
-        kind = ["VIDEO", "VIDEO", "METADATA", "EVENT_LOG"][index]
-        content_type = ["video/mp4", "video/mp4", "application/json", "application/x-ndjson"][index]
+        kind = ["VIDEO", "VIDEO", "METADATA"][index]
+        content_type = ["video/mp4", "video/mp4", "application/json"][index]
         files.append(edge.file_entry(directory, name, kind, content_type))
     state = {"schema_version": "camera-upload-state-v1", "config": config(), "files": files,
              "external_manifest": {"capture_group": {"capture_group_key": str(uuid.uuid4())}},
@@ -76,7 +76,7 @@ class FakePlatform:
         if path == "/upload/init":
             assert key == self.state["init_key"]
             assert body["manifest_sha256"] == self.state["manifest_sha256"]
-            assert body["file_count"] == 4
+            assert body["file_count"] == len(self.state["files"])
             assert body["total_size_bytes"] == sum(f["size_bytes"] for f in self.state["files"])
             self.keys.append(key)
             self.batch_count += 1
@@ -164,7 +164,7 @@ class UploadTests(unittest.TestCase):
                     edge.upload(directory, api)
                 self.assertEqual("UPLOADED", result["status"])
                 self.assertTrue(api.finalized)
-                self.assertEqual(5, len(api.puts))
+                self.assertEqual(4, len(api.puts))
                 self.assertEqual(1, len(set(api.keys)))
                 self.assertNotIn("secret=", (directory / "upload-state.json").read_text())
                 self.assertEqual(api.batch_id, result["batch_id"])
@@ -271,7 +271,7 @@ class PreparationTests(unittest.TestCase):
             first = edge.prepare(directory)
             self.assertEqual(first, edge.prepare(directory))
             self.assertEqual([1, 2], first["external_manifest"]["capture_group"]["expected_camera_numbers"])
-            self.assertEqual(4, len(first["files"]))
+            self.assertEqual(3, len(first["files"]))
             self.assertFalse(first["external_manifest"]["upload_set_finalized"])
             metadata = edge.read_json(directory / "metadata.json")
             self.assertEqual([0, 1], [stream["camera_index"] for stream in metadata["streams"]])

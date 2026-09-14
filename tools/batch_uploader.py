@@ -155,85 +155,75 @@ class PlatformClient:
                 raise RuntimeError(f"直传 S3 失败 (HTTP {resp.status})")
 
 
-def upload_single_video_file(client, video_path, project_id, device_id="PLATFORM_LOCAL"):
-    """执行单个 MP4 视频的完整上传与 CaptureGroup 组装"""
-    video_path = Path(video_path).resolve()
-    size_bytes = video_path.stat().st_size
-    file_hash = file_sha256(video_path)
-    client_file_id = str(uuid.uuid4())
-    content_type = "video/mp4"
+def ensure_uuid(val):
+    if val:
+        try:
+            return str(uuid.UUID(str(val)))
+        except Exception:
+            pass
+    return str(uuid.uuid4())
 
-    manifest_lines = [
-        "upload-file-manifest-v1\n",
-        f"{client_file_id.lower()}\tVIDEO\t{content_type}\t{size_bytes}\t{file_hash}\t{PART_SIZE}\n"
-    ]
-    manifest_sha256 = hashlib.sha256("".join(manifest_lines).encode("utf-8")).hexdigest()
 
-    # 1. 初始化上传批次
-    init_body = {
-        "project_id": project_id,
-        "device_id": "PLATFORM_LOCAL",
-        "upload_source_type": "PLATFORM_LOCAL",
-        "file_count": 1,
-        "total_size_bytes": size_bytes,
-        "manifest_sha256": manifest_sha256
-    }
-    batch = client.request("POST", "/upload/init", init_body, idempotency_key=str(uuid.uuid4()))
-    batch_id = batch["batch_id"]
+def ensure_iso_utc(ts_str):
+    if not ts_str:
+        return utc_now()
+    try:
+        clean = ts_str.replace("Z", "+00:00")
+        d = dt.datetime.fromisoformat(clean)
+        return d.astimezone(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except Exception:
+        return utc_now()
 
-    # 2. 注册文件
-    client.request(
+
+CAMERA_SET_CACHE = {}
+
+
+def ensure_camera_set(client, project_id, device_id, camera_count=1, layout_version="default-layout-v1"):
+    """确保项目内存在对应设备的 CameraSet 配置并返回 (camera_set_id, channel_id_map)"""
+    key = f"{device_id}-set"
+    version = 1
+    channel_map = {}
+    members = []
+    for cam_num in range(1, camera_count + 1):
+        prov_key = f"{device_id}.camera-{cam_num}"
+        ch_resp = client.request("PUT", f"/projects/{project_id}/camera-channels/{prov_key}")
+        ch_id = ch_resp["camera_channel_id"]
+        channel_map[cam_num] = ch_id
+        members.append({
+            "camera_channel_id": ch_id,
+            "camera_index": cam_num - 1,
+            "camera_role": "OVERVIEW" if cam_num == 1 else "HANDS",
+            "mount_position": f"camera-{cam_num}",
+            "enabled": True,
+        })
+    set_resp = client.request(
         "PUT",
-        f"/upload/{batch_id}/files/{client_file_id}",
-        {
-            "file_kind": "VIDEO",
-            "content_type": content_type,
-            "size_bytes": size_bytes,
-            "sha256": file_hash,
-            "part_size_bytes": PART_SIZE,
-            "file_name": video_path.name
-        },
-        idempotency_key=str(uuid.uuid4())
+        f"/projects/{project_id}/camera-sets/{key}/versions/{version}",
+        {"layout_version": layout_version, "members": members}
     )
-
-    # 3. 开启分片
-    client.request("PUT", f"/upload/{batch_id}/files/{client_file_id}/multipart")
-
-    # 4. 分片直传
-    total_parts = (size_bytes + PART_SIZE - 1) // PART_SIZE
-    with open(video_path, "rb") as f:
-        for part_number in range(1, total_parts + 1):
-            data = f.read(PART_SIZE)
-            part_hash = hashlib.sha256(data).hexdigest()
-            auth_resp = client.request(
-                "POST",
-                f"/upload/{batch_id}/files/{client_file_id}/parts/{part_number}/authorization",
-                {"sha256": part_hash}
-            )
-            upload_url = auth_resp["upload_url"]
-            client.put_part_to_s3(upload_url, data)
-            client.request("PUT", f"/upload/{batch_id}/files/{client_file_id}/parts/{part_number}/confirmation")
-
-    # 5. 完成并组装
-    client.request("PUT", f"/upload/{batch_id}/files/{client_file_id}/completion")
-    completion_resp = client.request("PUT", f"/upload/{batch_id}/completion")
-    clip_assets = completion_resp.get("clip_assets", [])
-    clip_asset_id = clip_assets[0]["clip_asset_id"] if clip_assets else None
-
-    session_resp = client.request("PUT", f"/upload/{batch_id}/capture-session")
-    capture_session_id = session_resp.get("capture_session_id")
-    group_id = session_resp.get("capture_group_id", capture_session_id)
-
-    return {
-        "batch_id": batch_id,
-        "capture_group_id": group_id,
-        "clip_asset_id": clip_asset_id,
-        "size_bytes": size_bytes
-    }
+    return set_resp["camera_set_id"], channel_map
 
 
-def upload_segment(client, segment_dir, project_id, device_id):
-    """上传一个切片目录内的所有视频并校验入库"""
+def is_valid_uuid(val):
+    if not val:
+        return False
+    try:
+        return str(uuid.UUID(str(val))).lower() == str(val).lower()
+    except Exception:
+        return False
+
+
+def get_or_create_camera_set(client, project_id, device_id, camera_count, layout_version):
+    cache_key = (project_id, device_id, camera_count, layout_version)
+    if cache_key in CAMERA_SET_CACHE:
+        return CAMERA_SET_CACHE[cache_key]
+    set_id, channel_map = ensure_camera_set(client, project_id, device_id, camera_count, layout_version)
+    CAMERA_SET_CACHE[cache_key] = (set_id, channel_map)
+    return set_id, channel_map
+
+
+def upload_segment(client, segment_dir, project_id, device_id, camera_set_id=None, layout_version=None):
+    """将切片目录（含多机位视频）组装为单一 V2 Manifest 批次并完整入库 CaptureGroup"""
     segment_dir = Path(segment_dir)
     meta_path = segment_dir / "segment_meta.json"
     if not meta_path.exists():
@@ -242,21 +232,206 @@ def upload_segment(client, segment_dir, project_id, device_id):
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
-    uploaded_records = []
-    for video_entry in meta.get("videos", []):
-        file_path = segment_dir / video_entry["file_name"]
-        if not file_path.exists():
-            raise FileNotFoundError(f"切片视频文件丢失: {file_path}")
-        rec = upload_single_video_file(client, file_path, project_id, device_id=device_id)
-        uploaded_records.append(rec)
+    videos_meta = meta.get("videos", [])
+    if not videos_meta:
+        raise ValueError(f"切片元数据中无有效视频项: {meta_path}")
+
+    captured_at = ensure_iso_utc(meta.get("captured_at"))
+    group_key = meta.get("segment_id") or f"seg_{uuid.uuid4().hex[:12]}"
+    session_id = str(uuid.uuid4())
+    layout = layout_version or "default-layout-v1"
+
+    if camera_set_id and is_valid_uuid(camera_set_id):
+        cam_set_id = str(uuid.UUID(str(camera_set_id)))
+        channel_map = {}
+    else:
+        cam_set_id, channel_map = get_or_create_camera_set(client, project_id, device_id, len(videos_meta), layout)
+
+    # 1. 整理视频文件及机位流信息
+    video_files = []
+    streams = []
+    declarations = []
+
+    for v in videos_meta:
+        cam_num = int(v.get("camera_number", 1))
+        file_name = v.get("file_name", f"camera_{cam_num}.mp4")
+        video_path = segment_dir / file_name
+        if not video_path.exists():
+            raise FileNotFoundError(f"切片视频文件丢失: {video_path}")
+
+        size_bytes = video_path.stat().st_size
+        file_hash = v.get("sha256") or file_sha256(video_path)
+        client_file_id = str(uuid.uuid4())
+        channel_id = channel_map.get(cam_num) or str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{device_id}.channel.{cam_num}"))
+
+        video_files.append({
+            "client_file_id": client_file_id,
+            "path": video_path,
+            "file_name": file_name,
+            "file_kind": "VIDEO",
+            "content_type": "video/mp4",
+            "size_bytes": size_bytes,
+            "sha256": file_hash,
+            "part_size_bytes": PART_SIZE,
+        })
+        streams.append({
+            "client_file_id": client_file_id,
+            "camera_channel_id": channel_id,
+            "camera_index": cam_num - 1,
+            "enabled": True,
+            "record_start_utc": captured_at,
+            "time_offset_ms": 0,
+            "sync_status": "UNKNOWN",
+        })
+        declarations.append({
+            "client_file_id": client_file_id,
+            "camera_number": cam_num,
+            "file_name": file_name,
+            "declared_size_bytes": size_bytes,
+            "sha256": file_hash,
+            "record_start_at": captured_at,
+        })
+
+    # 2. 生成 metadata.json (保留机位布局与流绑定，绝不生成已废弃的 event-log.ndjson)
+    metadata_obj = {
+        "schema_version": "capture-session-metadata-v1",
+        "capture_session_id": session_id,
+        "device_id": device_id,
+        "camera_set_id": cam_set_id,
+        "expected_camera_count": len(videos_meta),
+        "camera_layout_version": layout_version or "default-layout-v1",
+        "sync_group_id": group_key,
+        "device_time_utc": captured_at,
+        "device_timezone": "Asia/Shanghai",
+        "streams": streams,
+    }
+    meta_path_json = segment_dir / "metadata.json"
+    with open(meta_path_json, "w", encoding="utf-8") as f:
+        json.dump(metadata_obj, f, indent=2, ensure_ascii=False)
+
+    meta_size = meta_path_json.stat().st_size
+    meta_sha = file_sha256(meta_path_json)
+    meta_client_file_id = str(uuid.uuid4())
+    metadata_file = {
+        "client_file_id": meta_client_file_id,
+        "path": meta_path_json,
+        "file_name": "metadata.json",
+        "file_kind": "METADATA",
+        "content_type": "application/json",
+        "size_bytes": meta_size,
+        "sha256": meta_sha,
+        "part_size_bytes": PART_SIZE,
+    }
+
+    all_upload_files = video_files + [metadata_file]
+
+    # 3. 计算清单 SHA-256 (排序稳定)
+    manifest_lines = ["upload-file-manifest-v1\n"]
+    for f_info in sorted(all_upload_files, key=lambda item: item["client_file_id"]):
+        manifest_lines.append("\t".join(str(f_info[key]) for key in (
+            "client_file_id", "file_kind", "content_type", "size_bytes", "sha256", "part_size_bytes"
+        )) + "\n")
+    manifest_sha256 = hashlib.sha256("".join(manifest_lines).encode("utf-8")).hexdigest()
+
+    # 4. 提交 V2 External Ingest Manifest
+    external_manifest = {
+        "schema_version": "external-video-ingest-v2",
+        "source_system": "medication-camera",
+        "source_device_id": device_id,
+        "source_batch_id": group_key,
+        "capture_group": {
+            "capture_group_key": group_key,
+            "key_source": "UPSTREAM_MANIFEST_KEY",
+            "captured_at": captured_at,
+            "timezone": "Asia/Shanghai",
+            "expected_camera_numbers": sorted([v["camera_number"] for v in declarations]),
+        },
+        "videos": declarations,
+        "upload_set_finalized": False,
+    }
+    manifest_resp = client.request("POST", f"/projects/{project_id}/external-video-ingest-manifests/v2", external_manifest)
+    manifest_id = manifest_resp.get("manifest_id")
+
+    # 5. 初始化上传批次 (HOSPITAL_REMOTE 真实多机位来源)
+    total_bytes = sum(f["size_bytes"] for f in all_upload_files)
+    init_body = {
+        "project_id": project_id,
+        "device_id": device_id,
+        "upload_source_type": "HOSPITAL_REMOTE",
+        "file_count": len(all_upload_files),
+        "total_size_bytes": total_bytes,
+        "manifest_sha256": manifest_sha256,
+        "external_manifest_id": manifest_id,
+    }
+    batch = client.request("POST", "/upload/init", init_body, idempotency_key=f"batch-init-{group_key}")
+    batch_id = batch["batch_id"]
+
+    # 6a. 注册所有声明的文件 (平台约束：所有文件必须在分片开始前完成注册)
+    for f_info in all_upload_files:
+        fid = f_info["client_file_id"]
+        client.request(
+            "PUT",
+            f"/upload/{batch_id}/files/{fid}",
+            {
+                "file_kind": f_info["file_kind"],
+                "content_type": f_info["content_type"],
+                "size_bytes": f_info["size_bytes"],
+                "sha256": f_info["sha256"],
+                "part_size_bytes": f_info["part_size_bytes"],
+                "file_name": f_info["file_name"],
+            },
+            idempotency_key=f"file-{fid}"
+        )
+
+    # 6b. 逐个文件执行分片直传并完成
+    for f_info in all_upload_files:
+        fid = f_info["client_file_id"]
+        client.request("PUT", f"/upload/{batch_id}/files/{fid}/multipart")
+        f_size = f_info["size_bytes"]
+        num_parts = (f_size + PART_SIZE - 1) // PART_SIZE
+        with open(f_info["path"], "rb") as fp:
+            for part_num in range(1, num_parts + 1):
+                part_data = fp.read(PART_SIZE)
+                part_hash = hashlib.sha256(part_data).hexdigest()
+                auth_resp = client.request(
+                    "POST",
+                    f"/upload/{batch_id}/files/{fid}/parts/{part_num}/authorization",
+                    {"sha256": part_hash}
+                )
+                client.put_part_to_s3(auth_resp["upload_url"], part_data)
+                client.request("PUT", f"/upload/{batch_id}/files/{fid}/parts/{part_num}/confirmation")
+        client.request("PUT", f"/upload/{batch_id}/files/{fid}/completion")
+
+    # 7. 完成批次
+    completion_resp = client.request("PUT", f"/upload/{batch_id}/completion")
+    clip_assets = completion_resp.get("clip_assets", [])
+
+    # 8. 组装 CaptureSession 并获取 CaptureGroup
+    session_resp = client.request("PUT", f"/upload/{batch_id}/capture-session")
+    capture_session_id = session_resp.get("capture_session_id", session_id)
+    group_id = session_resp.get("capture_group_id", capture_session_id)
+
+    # 9. 终结收件回执
+    try:
+        client.request("POST", f"/projects/{project_id}/capture-groups/{group_id}/receipt/finalize")
+    except Exception as e:
+        print(f"[UPLOADER] [WARN] 收件回执终结提示: {e}")
+
+    record = {
+        "batch_id": batch_id,
+        "capture_group_id": group_id,
+        "capture_session_id": capture_session_id,
+        "clip_asset_count": len(clip_assets),
+        "total_size_bytes": total_bytes,
+    }
 
     meta["upload_status"] = "COMPLETED"
     meta["uploaded_at"] = utc_now()
-    meta["upload_records"] = uploaded_records
+    meta["upload_record"] = record
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
-    return uploaded_records
+    return [record]
 
 
 def clean_disk_if_needed(spool_dir, min_disk_free_gb, retention_hours):
@@ -383,7 +558,12 @@ def process_ready_batches(args, client, project_id):
         success_count = 0
         for seg_dir in active_segments:
             print(f"\n -> 正在上传切片: {seg_dir.name} ...")
-            records = upload_segment(client, seg_dir, project_id, device_id=args.device_id)
+            records = upload_segment(
+                client, seg_dir, project_id,
+                device_id=args.device_id,
+                camera_set_id=getattr(args, "camera_set_id", None),
+                layout_version=getattr(args, "camera_layout_version", None)
+            )
             for r in records:
                 print(f"    [OK] 采集组入库成功: CaptureGroup={r['capture_group_id']} (批次={r['batch_id']})")
             success_count += 1
@@ -451,6 +631,8 @@ def main():
     args.server = args.server or cfg.get("platform_base_url") or "http://localhost:8080"
     args.project_id = args.project_id or cfg.get("project_id")
     args.device_id = args.device_id or cfg.get("device_id") or "rk3588-01"
+    args.camera_set_id = cfg.get("camera_set_id") if is_valid_uuid(cfg.get("camera_set_id")) else None
+    args.camera_layout_version = cfg.get("camera_layout_version") or "default-layout-v1"
     args.spool = args.spool or cfg.get("spool_dir") or "/data/spool"
     args.batch_count = args.batch_count if args.batch_count is not None else cfg.get("batch_count", 5)
     args.batch_size_mb = args.batch_size_mb if args.batch_size_mb is not None else cfg.get("batch_size_mb", 500.0)
@@ -478,14 +660,17 @@ def main():
 
     while RUNNING:
         try:
-            # 解析 project_id
-            if not args.project_id:
-                client.login()
-                projects = client.request("GET", "/projects").get("items", [])
-                if not projects:
-                    raise RuntimeError("平台未建立任何项目，请先在平台新建项目")
-                args.project_id = projects[0]["project_id"]
-                print(f"[UPLOADER] 自动绑定平台项目: {projects[0].get('display_name', args.project_id)} ({args.project_id})")
+            # 解析与验证 project_id
+            client.login()
+            active_projects = client.request("GET", "/projects").get("items", [])
+            if not active_projects:
+                raise RuntimeError("平台未建立任何可用项目，请先在平台新建项目")
+            active_ids = {p["project_id"] for p in active_projects}
+            if not args.project_id or args.project_id not in active_ids:
+                if args.project_id:
+                    print(f"[UPLOADER] [WARN] 项目 {args.project_id} 不存在或不可用，自动切换至有效项目...")
+                args.project_id = active_projects[0]["project_id"]
+                print(f"[UPLOADER] 自动绑定平台项目: {active_projects[0].get('display_name', args.project_id)} ({args.project_id})")
 
             processed = process_ready_batches(args, client, args.project_id)
             backoff = 5  # 成功后重置退避计时

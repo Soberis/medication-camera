@@ -274,14 +274,7 @@ def prepare(directory, ffmpeg="ffmpeg"):
                 "sync_group_id": group, "device_time_utc": task["captured_at"],
                 "device_timezone": config["timezone"], "streams": streams}
     atomic_json(directory / "metadata.json", metadata)
-    # EVENT_LOG is NDJSON, distinct from the platform's versioned metadata object.
-    event = {"schema_version": "camera-event-v1", "event_id": task["capture_session_id"],
-             "event_type": "CAPTURE_COMPLETED", "capture_session_id": task["capture_session_id"],
-             "capture_group_key": group, "occurred_at": now()}
-    with (directory / "event-log.ndjson").open("w", encoding="utf-8", newline="\n") as output:
-        output.write(json.dumps(event) + "\n")
-    files = videos + [file_entry(directory, "metadata.json", "METADATA", "application/json"),
-                      file_entry(directory, "event-log.ndjson", "EVENT_LOG", "application/x-ndjson")]
+    files = videos + [file_entry(directory, "metadata.json", "METADATA", "application/json")]
     manifest = {"schema_version": "external-video-ingest-v2", "source_system": config["source_system"],
                 "source_device_id": config["device_id"], "source_batch_id": group,
                 "capture_group": {"capture_group_key": group, "key_source": "UPSTREAM_MANIFEST_KEY",
