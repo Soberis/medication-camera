@@ -1,8 +1,17 @@
 # medication-camera
 
-RK3588 边缘端多路音视频采集与配药合规质检云平台（`medication-video-platform`）对接流水线。
+配药视觉质检体系中的 **RK3588 边缘端音视频采集与直传流水线**。与云端平台 [medication-video-platform](https://github.com/Soberis/medication-video-platform/tree/dev) 无缝对接。
 
 专为医院药房、静配中心等严苛现场环境打造，支持 **开机无人值守定长切片录制** 与 **外部 IO 按钮 / USB 脚踏板 / 局域网 HTTP 事件驱动录制**，并提供断网无损暂存、定量/超时批量上传、磁盘空间自维护及开机 systemd 守护体系。
+
+---
+
+## 关联项目生态
+
+本项目是配药视觉质检体系中的边缘采集流水线：
+- **边缘采集端**：**medication-camera**（本项目）— RK3588 边缘工控机多机位音视频同步录制、本地缓冲池维护及批量直传流水线。
+- **云端中心平台**：[medication-video-platform](https://github.com/Soberis/medication-video-platform/tree/dev) — Java Core API + React 标注管理端，负责数据接收归组、MediaPipe 手部分析、标注任务调度与数据集导出。
+- **动作推理节点**：[medication-action-worker](https://github.com/Soberis/medication-action-worker/tree/dev) — RTX 4090 GPU 节点，基于 Qwen 视觉大语言模型进行有时序边界的动作候选推理。
 
 ---
 
@@ -46,6 +55,8 @@ RK3588 边缘端多路音视频采集与配药合规质检云平台（`medicatio
                ▼
 [medication-video-platform 配药质检云平台]
 ```
+
+> **数据下游流转**：切片上传入库后，由 [medication-video-platform](https://github.com/Soberis/medication-video-platform/tree/dev) 自动进行媒体质检（Media Probe）与 MediaPipe 手部姿态检测，并通过消息队列派发给 [medication-action-worker](https://github.com/Soberis/medication-action-worker/tree/dev) 完成 Qwen 动作时序候选识别，最终在 Web 工作台实现自动草稿铺设/人机协同标注与 HDF5 训练集导出。
 
 ### 本地缓冲池（Spooling Pool）状态机
 - `/data/spool/recording/`：正在录制的切片临时工作目录。
