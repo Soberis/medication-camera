@@ -2,10 +2,12 @@
 set -euo pipefail
 
 # ==============================================================================
-# RK3588 边缘端系统服务一键安装脚本 (medication-camera)
+# RK3588 边缘端系统服务一键安装脚本 (medication-camera-edge)
 # ==============================================================================
 
-PROJECT_DIR="/home/firefly/projects/medication-camera"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="${PROJECT_DIR:-$SCRIPT_DIR}"
+PROJECT_DIR="${PROJECT_DIR:-/home/firefly/projects/medication-camera-edge}"
 SPOOL_DIR="/data/spool"
 
 echo "=== [1/4] 创建本地缓冲池目录: ${SPOOL_DIR} ==="

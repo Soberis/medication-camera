@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/firefly/projects/medication-camera
+WorkingDirectory=/home/firefly/projects/medication-camera-edge
 ExecStart=/usr/bin/python3 -u tools/batch_uploader.py \
     --config config/edge_continuous.json
 Restart=always

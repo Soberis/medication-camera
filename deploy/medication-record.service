@@ -5,7 +5,7 @@ After=local-fs.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/firefly/projects/medication-camera
+WorkingDirectory=/home/firefly/projects/medication-camera-edge
 ExecStart=/usr/bin/python3 -u tools/loop_recorder.py \
     --config config/edge_continuous.json \
     --spool /data/spool \

@@ -1,4 +1,4 @@
-# medication-camera
+# medication-camera-edge
 
 配药视觉质检体系中的 **RK3588 边缘端音视频采集与直传流水线**。与云端平台 [medication-video-platform](https://github.com/Soberis/medication-video-platform/tree/dev) 无缝对接。
 
@@ -9,7 +9,7 @@
 ## 关联项目生态
 
 本项目是配药视觉质检与具身操作数据体系中的边缘现场采集流水线：
-- **边缘采集端**：**medication-camera**（本项目）— RK3588 边缘工控机多机位音视频同步录制、本地缓冲池维护及批量直传流水线。
+- **边缘采集端**：**medication-camera-edge**（本项目）— RK3588 边缘工控机多机位音视频同步录制、本地缓冲池维护及批量直传流水线。
 - **公开示范挖掘端**：[medication-dataset-tools](https://github.com/Soberis/medication-dataset-tools/tree/dev) — 第一人称及双手配药实操网络视频跨平台检索、量化质检与去重工具集。
 - **云端中心平台**：[medication-video-platform](https://github.com/Soberis/medication-video-platform/tree/dev) — Java Core API + React 标注管理端，负责数据接收归组、MediaPipe 手部分析、标注任务调度与数据集导出。
 - **动作推理节点**：[medication-action-worker](https://github.com/Soberis/medication-action-worker/tree/dev) — RTX 4090 GPU 节点，基于 Qwen 视觉大语言模型进行有时序边界的动作候选推理。
@@ -78,7 +78,7 @@
 在 RK3588 终端执行：
 
 ```bash
-cd /home/firefly/projects/medication-camera
+cd /home/firefly/projects/medication-camera-edge
 
 # 1. 编译 C++ 录像程序
 cmake -S . -B build \
